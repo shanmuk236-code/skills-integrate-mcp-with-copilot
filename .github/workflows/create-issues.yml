@@ -1,0 +1,95 @@
+name: Create issues from drafts
+
+on:
+  workflow_dispatch:
+    inputs:
+      label:
+        description: 'Comma-separated labels to apply to created issues'
+        required: false
+        default: 'Ok'
+      issues_dir:
+        description: 'Directory containing draft issue .md files'
+        required: false
+        default: '.github/ISSUES'
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  create-issues:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Create issues from drafts
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const issuesDir = (context.payload.inputs && context.payload.inputs.issues_dir) || '.github/ISSUES';
+            const labelInput = (context.payload.inputs && context.payload.inputs.label) || 'Ok';
+            const labels = labelInput.split(',').map(s=>s.trim()).filter(Boolean);
+
+            const workspace = process.env.GITHUB_WORKSPACE || '.';
+            const dir = path.join(workspace, issuesDir);
+            core.info(`Using issues directory: ${dir}`);
+            if (!fs.existsSync(dir)) {
+              core.info('No issues directory found — nothing to do.');
+              return;
+            }
+
+            const files = fs.readdirSync(dir).filter(f => f.endsWith('.md')).sort();
+            if (files.length === 0) {
+              core.info('No .md files found in the issues directory.');
+              return;
+            }
+
+            // Fetch existing issues to avoid duplicates (first 300 issues)
+            let existing = [];
+            try {
+              existing = await github.paginate(github.rest.issues.listForRepo, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 100,
+              }, (res) => res.data);
+            } catch (e) {
+              core.warning('Failed to list existing issues: ' + e.message);
+            }
+
+            for (const f of files) {
+              const full = path.join(dir, f);
+              core.info(`Processing ${full}`);
+              const content = fs.readFileSync(full, 'utf8');
+              const lines = content.split(/\r?\n/);
+              const titleMatch = lines[0] && lines[0].match(/^Title:\s*(.*)$/);
+              if (!titleMatch) {
+                core.info(`  Skipping ${f} — missing Title line`);
+                continue;
+              }
+              const title = titleMatch[1].trim();
+              const body = lines.slice(1).join('\n').trim();
+
+              // Check for existing issue with same title
+              const found = existing.find(i => i.title && i.title.trim() === title);
+              if (found) {
+                core.info(`  Issue already exists: ${found.html_url} — skipping`);
+                continue;
+              }
+
+              core.info(`  Creating issue: ${title}`);
+              try {
+                const created = await github.rest.issues.create({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  title,
+                  body,
+                  labels,
+                });
+                core.info(`  Created: ${created.data.html_url}`);
+              } catch (err) {
+                core.error(`  Failed to create issue for ${title}: ${err.message}`);
+              }
+            }
